@@ -137,7 +137,7 @@
         return bytes;
     }
 
-    async function derivePasswordKey(password, salt, usages) {
+    async function derivePasswordKey(password, salt, iterations, usages) {
         const baseKey = await window.crypto.subtle.importKey(
             'raw',
             textEncoder.encode(String(password)),
@@ -150,7 +150,7 @@
             {
                 name: 'PBKDF2',
                 salt: salt,
-                iterations: PBKDF2_ITERATIONS,
+                iterations: iterations,
                 hash: 'SHA-256'
             },
             baseKey,
@@ -192,7 +192,7 @@
     async function createPrivateKeyBox(password, privateJwk) {
         const salt = window.crypto.getRandomValues(new Uint8Array(16));
         const iv = window.crypto.getRandomValues(new Uint8Array(12));
-        const wrappingKey = await derivePasswordKey(password, salt, ['encrypt']);
+        const wrappingKey = await derivePasswordKey(password, salt, PBKDF2_ITERATIONS, ['encrypt']);
         const ciphertext = new Uint8Array(await window.crypto.subtle.encrypt(
             {
                 name: 'AES-GCM',
@@ -212,7 +212,8 @@
     }
 
     async function openPrivateKeyBox(password, box) {
-        const wrappingKey = await derivePasswordKey(password, base64ToBytes(box.salt), ['decrypt']);
+        const iterations = Number(box && box.iterations) || PBKDF2_ITERATIONS;
+        const wrappingKey = await derivePasswordKey(password, base64ToBytes(box.salt), iterations, ['decrypt']);
         const plaintext = await window.crypto.subtle.decrypt(
             {
                 name: 'AES-GCM',
@@ -250,11 +251,11 @@
         };
     }
 
-    async function postKeyMaterial(publicKey, privateKeyBox) {
+    async function postKeyMaterial(action, publicKey, privateKeyBox) {
         const response = await window.fetch('api.php', {
             method: 'POST',
             body: new URLSearchParams({
-                action: 'store_keys',
+                action: action,
                 csrf_token: window.CSRF_TOKEN || '',
                 public_key: JSON.stringify(publicKey),
                 private_key_box: JSON.stringify(privateKeyBox)
@@ -264,6 +265,55 @@
         if (!response.ok) {
             throw new Error('ذخیره کلیدهای رمزنگاری روی سرور انجام نشد.');
         }
+    }
+
+    async function verifyAccountPassword(password) {
+        const response = await window.fetch('api.php', {
+            method: 'POST',
+            body: new URLSearchParams({
+                action: 'verify_password',
+                csrf_token: window.CSRF_TOKEN || '',
+                password: String(password || '')
+            })
+        });
+
+        return response.ok;
+    }
+
+    async function requestVerifiedPassword(email, message) {
+        let password = takePendingPassword(email);
+        if (!password) {
+            password = window.prompt(message) || '';
+        }
+        if (!password) {
+            throw new Error('برای ادامه باید رمز عبور حساب را وارد کنید.');
+        }
+
+        const valid = await verifyAccountPassword(password);
+        if (!valid) {
+            throw new Error('رمز عبور حساب صحیح نیست.');
+        }
+
+        return password;
+    }
+
+    async function regenerateKeysWithPassword(email, password) {
+        const generated = await generateUserKeys(password);
+        await postKeyMaterial('replace_keys', generated.publicJwk, generated.privateKeyBox);
+
+        const currentUser = window.CURRENT_USER_CRYPTO || {};
+        currentUser.publicKey = generated.publicJwk;
+        currentUser.privateKeyBox = generated.privateKeyBox;
+        currentUser.cryptoVersion = USER_CRYPTO_VERSION;
+        saveUnlockedPrivateJwk(email, generated.privateJwk);
+
+        return {
+            email: email,
+            publicKey: generated.publicKey,
+            privateKey: generated.privateKey,
+            publicJwk: generated.publicJwk,
+            privateJwk: generated.privateJwk
+        };
     }
 
     async function ensureCurrentUserReady() {
@@ -287,16 +337,10 @@
 
             if (!hasStoredKeys) {
                 setStatus('در حال ساخت کلیدهای رمزنگاری گفتگوها...');
-                let password = takePendingPassword(email);
-                if (!password) {
-                    password = window.prompt('برای فعال‌سازی رمزنگاری گفتگوها، رمز عبور حساب را دوباره وارد کنید:') || '';
-                }
-                if (!password) {
-                    throw new Error('برای فعال‌سازی رمزنگاری باید رمز عبور حساب را وارد کنید.');
-                }
+                const password = await requestVerifiedPassword(email, 'برای فعال‌سازی رمزنگاری گفتگوها، رمز عبور حساب را وارد کنید:');
 
                 const generated = await generateUserKeys(password);
-                await postKeyMaterial(generated.publicJwk, generated.privateKeyBox);
+                await postKeyMaterial('store_keys', generated.publicJwk, generated.privateKeyBox);
 
                 currentUser.publicKey = generated.publicJwk;
                 currentUser.privateKeyBox = generated.privateKeyBox;
@@ -316,18 +360,18 @@
 
             if (!privateJwk) {
                 setStatus('در حال باز کردن کلید خصوصی گفتگوها...');
-                let password = takePendingPassword(email);
-                if (!password) {
-                    password = window.prompt('برای باز کردن گفتگوهای رمزنگاری‌شده، رمز عبور حساب را وارد کنید:') || '';
-                }
-                if (!password) {
-                    throw new Error('برای باز کردن گفتگوها باید رمز عبور حساب را وارد کنید.');
-                }
+                const password = await requestVerifiedPassword(email, 'برای باز کردن گفتگوهای رمزنگاری‌شده، رمز عبور حساب را وارد کنید:');
 
                 try {
                     privateJwk = await openPrivateKeyBox(password, currentUser.privateKeyBox);
                 } catch (error) {
-                    throw new Error('رمز عبور برای باز کردن کلید خصوصی صحیح نیست.');
+                    const shouldReset = window.confirm('کلید خصوصی با این رمز عبور باز نشد. احتمالاً هنگام راه‌اندازی اولیه رمز عبور اشتباه وارد شده است. اگر کلیدها را از نو بسازید، پیام‌های رمزنگاری‌شده قبلی دیگر قابل خواندن نخواهند بود. آیا بازسازی انجام شود؟');
+                    if (!shouldReset) {
+                        throw new Error('رمز عبور برای باز کردن کلید خصوصی صحیح نیست.');
+                    }
+
+                    setStatus('در حال بازسازی کلیدهای رمزنگاری...');
+                    return regenerateKeysWithPassword(email, password);
                 }
 
                 saveUnlockedPrivateJwk(email, privateJwk);

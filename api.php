@@ -66,6 +66,71 @@ if ($action === 'store_keys') {
     exit('OK');
 }
 
+if ($action === 'replace_keys') {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        exit('METHOD');
+    }
+
+    verify_csrf_or_abort($_POST['csrf_token'] ?? '');
+
+    $publicKey = app_validate_public_key_jwk(app_json_decode_object($_POST['public_key'] ?? ''));
+    $privateKeyBox = app_validate_private_key_box(app_json_decode_object($_POST['private_key_box'] ?? ''));
+    if ($publicKey === null || $privateKeyBox === null) {
+        http_response_code(400);
+        exit('KEYS');
+    }
+
+    $updated = false;
+    json_update_file(APP_USERS_FILE, [], function ($storedUsers) use ($myEmail, $publicKey, $privateKeyBox, &$updated) {
+        $storedUsers = is_array($storedUsers) ? $storedUsers : [];
+        foreach ($storedUsers as &$user) {
+            if (normalize_email($user['email'] ?? '') !== $myEmail) {
+                continue;
+            }
+
+            $user['crypto_version'] = 'e2ee-rsa-oaep-aes-gcm-v1';
+            $user['public_key'] = $publicKey;
+            $user['private_key_box'] = $privateKeyBox;
+            $updated = true;
+            return $storedUsers;
+        }
+        unset($user);
+
+        return $storedUsers;
+    });
+
+    if (!$updated) {
+        http_response_code(404);
+        exit('USER');
+    }
+
+    exit('OK');
+}
+
+if ($action === 'verify_password') {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        exit('METHOD');
+    }
+
+    verify_csrf_or_abort($_POST['csrf_token'] ?? '');
+
+    $password = (string) ($_POST['password'] ?? '');
+    $user = app_user_record($myEmail, $users);
+    if (!is_array($user) || !isset($user['password']) || !is_string($user['password'])) {
+        http_response_code(404);
+        exit('USER');
+    }
+
+    if ($password === '' || !password_verify($password, $user['password'])) {
+        http_response_code(403);
+        exit('PASSWORD');
+    }
+
+    exit('OK');
+}
+
 if ($action === 'send') {
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
         http_response_code(405);
